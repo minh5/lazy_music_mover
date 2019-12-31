@@ -1,17 +1,19 @@
 import datetime
+import logging
 import os
 import requests
 
 import google_auth_oauthlib.flow
 import googleapiclient.discovery
 import googleapiclient.errors
+import more_itertools
 import spotipy
 import spotipy.util as util
 
 
 # spotify creds
 # TODO: make sure that this can be overridden manually
-SPOTIFY_PLAYLISTS = ['Main Playlist', 'Archives']
+SPOTIFY_PLAYLISTS = ['Main List', 'Archives']
 SPOTIFY_CLIENT_ID = os.getenv('SPOTIFY_CLIENT_ID')
 SPOTIFY_CLIENT_SECRET = os.getenv('SPOTIFY_CLIENT_SECRET')
 SPOTIFY_USER_NAME = os.getenv('SPOTIFY_USER_NAME')
@@ -23,6 +25,7 @@ SCOPE = ["https://www.googleapis.com/auth/youtube"]
 
 
 def retrieve_playlist_info(headers, playlist_name):
+    """Retrieve Spotify playlist information"""
     playlist_url = f'https://api.spotify.com/v1/users/{SPOTIFY_USER_NAME}/playlists'
     res = requests.get(playlist_url, headers=headers)
     res.raise_for_status()
@@ -31,17 +34,13 @@ def retrieve_playlist_info(headers, playlist_name):
     return results
 
 
-def _get_songs_in_playlist(headers, playlist_id):
+def get_songs_in_playlist(spotify_api_header, playlist_info):
+    """Retrieve the search terms for songs for a single playlist"""
     url = f'https://api.spotify.com/v1/playlists/{playlist_id}/tracks'
-    res = requests.get(url, headers=headers)
+    res = requests.get(url, headers=spotify_api_header)
     res.raise_for_status()
-    return res.json()
-
-
-def get_songs_in_playlist(playlist_info):
+    tracks = res.json()
     search_terms = []
-    tracks = _get_songs_in_playlist(
-        spotify_api_header, playlist_info['id'])
 
     for track in tracks['items']:
         artists = ' '.join([
@@ -53,23 +52,29 @@ def get_songs_in_playlist(playlist_info):
 
 
 def retrieve_spotify_info():
+    """Authenticate and Retrieve the search terms from the songs by Spotify playlists
+    """
     results = {}
     token = util.prompt_for_user_token(
         username=SPOTIFY_USER_NAME,
         scope='playlist-read-private',
         client_id=SPOTIFY_CLIENT_ID,
         client_secret=SPOTIFY_CLIENT_SECRET,
-        redirect_url=SPOTIFY_REDIRECT_URL)
+        redirect_uri=SPOTIFY_REDIRECT_URL)
     spotify_api_header = {'Authorization': f'Bearer {token}'}
 
     for playlist in SPOTIFY_PLAYLISTS:
-        pl_info = retrieve_playlist(spotify_api_header, playlist)
-        results[playlist] = get_songs_in_playlist(pl_info)
+        pl_info = retrieve_playlist_info(spotify_api_header, playlist)
+        results[playlist] = get_songs_in_playlist(spotify_api_header, pl_info)
 
     return results
 
 
 def get_youtube_client():
+    """Instaniate and authenticate the Youtube Python Client
+
+    Simply copied from: https://developers.google.com/youtube/v3/docs/playlistItems/list?apix=true
+    """
     # Disable OAuthlib's HTTPS verification when running locally.
     # *DO NOT* leave this option enabled in production.
     os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"
@@ -88,6 +93,7 @@ def get_youtube_client():
 
 
 def create_playlists(client, playlist_name):
+    """Create a Youtube playlist"""
     request = client.playlists().insert(
         part="snippet,status",
         body={
@@ -106,29 +112,66 @@ def create_playlists(client, playlist_name):
         }
     )
     response = request.execute()
-    return {playlist_name: response['id']}
+    return response['id']
 
 
 def add_song_to_playlist(yt_client, search_terms, playlist_id):
+    """Add a song to a given playlist"""
+    next_page_token = None
+    existing_songs = []
+
+    # retrieve all songs in playlist
+    while True:
+        request = client.playlistItems().list(
+            part='snippet', playlistId=playlist_id, pageToken=next_page_token)
+        response = request.execute()
+        existing_songs.extend(
+            pi['contentDetails']['videoId'] for pi in response['items'])
+        next_page_token = response.get('nextPageToken')
+
+        if not next_page_token:
+            break
+
+
     for term in search_terms:
+        logging.info(f'working on {term}')
         request = yt_client.search().list(part='snippet', q=term, type='video')
         response = request.execute()
         video_id = response['items'][0]['id']['videoId']
+        request = client.playlistItems().insert(
+            part='snippet',
+            body={
+                'snippet': {
+                    'playlistId': playlist_id,
+                    'resourceId': {
+                        "kind": "youtube#video",
+                        "videoId": video_id
+                    }
+                }
+            }
+        )
+        response = request.execute()
 
 
-def sync_youtube():
-    pass
+def sync_youtube(client, spotify_info):
+    """Sync the Youtube playlist given Spotify metadata"""
+    for pl in SPOTIFY_PLAYLISTS:
+        request = client.playstlis().list(mine=True)
+        response = request.execute()
+        existing_yt_playlists = [pl['name'] for pl in response['items']]
+
+        if pl in existing_yt_playlists:
+            yt_id = more_itertools.one(
+                [pl['id'] for pl in response['items'] if pl['name'] == pl])
+        else:
+            yt_id = create_playlists(client, pl)
+        tracks = add_song_to_playlist(client, spotify_info[pl], yt_id)
 
 
 def main():
-    spotify_info = get_spotify_songs()
+    spotify_info = retrieve_spotify_info()
     client = get_youtube_client()
-
-    # create the playlists
-    yt_playlists = {}
-    for pl in SPOTIFY_PLAYLISTS:
-        yt_id = create_playlists(client, pl)
-        tracks = spotify_info[pl]
+    sync_youtube(client, spotify_info)
 
 
 
