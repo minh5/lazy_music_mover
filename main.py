@@ -172,19 +172,3 @@ def main():
     spotify_info = retrieve_spotify_info()
     client = get_youtube_client()
     sync_youtube(client, spotify_info)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
